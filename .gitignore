@@ -9,3 +9,6 @@ src/docs
 *.ts
 dist/
 *.egg-info*
+src/backend/xai
+.github
+.claude

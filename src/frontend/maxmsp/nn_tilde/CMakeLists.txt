@@ -61,11 +61,12 @@ add_custom_command(
 	)
 
 if (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
-	add_custom_command( 
-		TARGET ${PROJECT_NAME} 
-		POST_BUILD 
+	add_custom_command(
+		TARGET ${PROJECT_NAME}
+		POST_BUILD
+		COMMAND "xattr" "-cr" "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${${PROJECT_NAME}_EXTERN_OUTPUT_NAME}.mxo"
 		COMMAND "codesign" "--force" "--deep" "-s" "-" "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${${PROJECT_NAME}_EXTERN_OUTPUT_NAME}.mxo"
-		COMMENT "Codesign external" 
+		COMMENT "Codesign external"
 	)
 endif()
 endif()

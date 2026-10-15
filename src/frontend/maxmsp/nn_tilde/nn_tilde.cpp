@@ -1,11 +1,18 @@
+#include "c74_min.h"
 #include "../../../backend/backend.h"
 #include "../shared/circular_buffer.h"
-#include "c74_min.h"
+#include "../shared/min_dictionary.h"
+#include <atomic>
 #include <chrono>
-#include <semaphore>
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef __SSE__
+#include <xmmintrin.h>
+#endif
+#ifdef __SSE3__
+#include <pmmintrin.h>
+#endif
 
 #ifndef VERSION
 #define VERSION "UNDEFINED"
@@ -25,10 +32,10 @@ unsigned power_ceil(unsigned x) {
 
 class nn : public object<nn>, public vector_operator<> {
 public:
-  MIN_DESCRIPTION{"Interface for deep learning models"};
+  MIN_DESCRIPTION{"Interface for deep learning models + network bending imported models"};
   MIN_TAGS{"audio, deep learning, ai"};
   MIN_AUTHOR{"Antoine Caillon & Axel Chemla--Romeu-Santos, mod by Błażej "
-             "Kotowski, Leonardo Foletto"};
+             "Kotowski, Nico García-Peguinho"};
 
   nn(const atoms &args = {});
   ~nn();
@@ -53,9 +60,11 @@ public:
   std::vector<std::unique_ptr<float[]>> m_in_model, m_out_model;
 
   // AUDIO PERFORM
-  bool m_use_thread, m_should_stop_perform_thread;
+  bool m_use_thread;
+  std::atomic<bool> m_should_stop_perform_thread;
   std::unique_ptr<std::thread> m_compute_thread;
-  std::binary_semaphore m_data_available_lock, m_result_available_lock;
+  std::atomic<bool> m_data_available;
+  std::atomic<bool> m_result_available;
 
   void operator()(audio_bundle input, audio_bundle output);
   void perform(audio_bundle input, audio_bundle output);
@@ -78,96 +87,150 @@ public:
                       description{"Enable / disable gpu usage when available"},
                       setter{[this](const c74::min::atoms &args,
                                     const int inlet) -> c74::min::atoms {
-                        if (m_is_backend_init)
+                        if (m_model->is_loaded())
                           m_model->use_gpu(bool(args[0]));
                         return args;
                       }}};
 
   // NN BENDING MOD
-  outlet<> m_info_outlet{this, "info", "Info outlet for layers and weights"};
+  outlet<> m_info_outlet{this, "info", "Info outlet for bend groups, layer metadata, and confirmations"};
 
-  message<> layers{
-      this, "layers", "Get available model layers",
-      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_is_backend_init) {
-          cerr << "Model not initialized" << endl;
-          return {};
-        }
-        std::vector<std::string> layers = m_model->get_available_layers();
-        atoms out_atoms;
-        out_atoms.push_back("layers");
-        for (const auto &layer : layers) {
-          out_atoms.push_back(layer);
-        }
-        m_info_outlet.send(out_atoms);
-        return {};
-      }};
+  // buffer_reference used by get_layer and bend_layer for buffer~ transport
+  // create_messages=false prevents auto-registering "set"/"dblclick"/"notify" which would conflict
+  buffer_reference m_tensor_buf_ref { this, nullptr, false };
 
-  message<> get_weights{
-      this, "get_weights", "Get weights for a specific layer",
+  // get_layer <layer_name> <buffer_name>
+  // writes flat floats into buffer~ (auto-resized), then sends layer_info out info outlet:
+  //   layer_info <name> <total_floats> <ndim> <d0> [d1] [d2] <group>
+  message<> get_layer{
+      this, "get_layer", "Fetch a layer's weights into a named buffer~",
       [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_is_backend_init) {
-          cerr << "Model not initialized" << endl;
-          return {};
-        }
-        if (args.size() < 1) {
-          cerr << "Layer name required" << endl;
-          return {};
-        }
+        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
+        if (args.size() < 2) { cerr << "get_layer: layer name and buffer name required" << endl; return {}; }
         std::string layer_name = args[0];
+        symbol buf_name = symbol(std::string(args[1]));
         std::vector<float> weights = m_model->get_layer_weights(layer_name);
-        atoms out_atoms;
-        out_atoms.push_back("layer");
-        for (const auto &weight : weights) {
-          out_atoms.push_back(weight);
+        if (weights.empty()) {
+          cerr << "get_layer: no weights found for '" << layer_name << "'" << endl;
+          return {};
         }
-        m_info_outlet.send(out_atoms);
+        m_tensor_buf_ref.set(buf_name);
+        if (!m_tensor_buf_ref) {
+          cerr << "get_layer: buffer~ '" << std::string(buf_name) << "' not found" << endl;
+          return {};
+        }
+        // resize in separate scope first — resize invalidates the internal pointer
+        { buffer_lock<false> size_lock(m_tensor_buf_ref); size_lock.resize_in_samples(static_cast<int>(weights.size())); }
+        {
+          buffer_lock<false> lock(m_tensor_buf_ref);
+          if (!lock.valid()) { cerr << "get_layer: buffer~ resize failed" << endl; return {}; }
+          if (lock.frame_count() < weights.size()) { cerr << "get_layer: buffer~ too small after resize (" << lock.frame_count() << " < " << weights.size() << ")" << endl; return {}; }
+          for (size_t i = 0; i < weights.size(); i++) { lock[i] = weights[i]; }
+          lock.dirty();
+        }
+        auto shape = m_model->get_layer_shape(layer_name);
+        std::string group = m_model->get_layer_group(layer_name);
+        atoms out;
+        out.push_back("layer_info");
+        out.push_back(symbol(layer_name));
+        out.push_back(static_cast<int>(weights.size()));
+        out.push_back(static_cast<int>(shape.size()));
+        for (auto d : shape) { out.push_back(static_cast<int>(d)); }
+        out.push_back(symbol(group));
+        m_info_outlet.send(out);
         return {};
       }};
 
-  message<> set_weights{
-      this, "set_weights", "Set weights for a specific layer",
+  // bend_layer <layer_name> <buffer_name>
+  // reads floats from buffer~, reshapes to layer dims, stores in registry (persistent across reloads)
+  // responds: bend_ok <layer_name>
+  message<> bend_layer{
+      this, "bend_layer", "Apply weights from a buffer~ to a layer and persist through reloads",
       [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_is_backend_init) {
-          cerr << "Model not initialized" << endl;
-          return {};
-        }
-        if (args.size() < 2) {
-          cerr << "Layer name and weights required" << endl;
-          return {};
-        }
+        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
+        if (args.size() < 2) { cerr << "bend_layer: layer name and buffer name required" << endl; return {}; }
         std::string layer_name = args[0];
+        symbol buf_name = symbol(std::string(args[1]));
         std::vector<float> weights;
-        for (size_t i = 1; i < args.size(); i++) {
-          if (args[i].type() == message_type::float_argument) {
-            weights.push_back(float(args[i]));
-          }
+        m_tensor_buf_ref.set(buf_name);
+        if (!m_tensor_buf_ref) {
+          cerr << "bend_layer: buffer~ '" << std::string(buf_name) << "' not found" << endl;
+          return {};
+        }
+        {
+          buffer_lock<false> lock(m_tensor_buf_ref);
+          if (!lock.valid()) { cerr << "bend_layer: buffer~ has no samples" << endl; return {}; }
+          size_t len = lock.frame_count();
+          weights.reserve(len);
+          for (size_t i = 0; i < len; i++) { weights.push_back(lock[i]); }
         }
         try {
-          m_model->set_layer_weights(layer_name, weights);
+          m_model->bend_layer(layer_name, weights);
+          m_info_outlet.send("bend_ok", symbol(layer_name));
         } catch (const std::exception &e) {
-          cerr << "Error setting weights: " << e.what() << endl;
+          cerr << "bend_layer: " << e.what() << endl;
         }
         return {};
       }};
 
-  message<> reload{
-      this, "reload", "Reload the model",
+  message<> reload_model{
+      this, "reload_model", "Reload the model from disk and re-apply stored bends",
       [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_is_backend_init) {
-          cerr << "Model not initialized" << endl;
-          return {};
-        }
+        if (!m_model->is_loaded()) { cerr << "reload_model: no model loaded" << endl; return {}; }
         m_model->reload();
         return {};
       }};
+
+  message<> get_bend_groups{
+      this, "get_bend_groups", "Get available bend groups",
+      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
+        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
+        atoms out;
+        out.push_back("bend_groups");
+        for (const auto &g : m_model->get_bend_groups())
+          out.push_back(g);
+        m_info_outlet.send(out);
+        return {};
+      }};
+
+  message<> get_bend_layers{
+      this, "get_bend_layers", "Get layers in a bend group",
+      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
+        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
+        if (args.size() < 1) { cerr << "get_bend_layers: group name required" << endl; return {}; }
+        std::string group = args[0];
+        atoms out;
+        out.push_back("bend_layers");
+        for (const auto &l : m_model->get_bend_layers_in_group(group))
+          out.push_back(l);
+        m_info_outlet.send(out);
+        return {};
+      }};
+
+  message<> reset_bend{
+      this, "reset_bend", "Reset a layer to its original weights",
+      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
+        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
+        if (args.size() < 1) { cerr << "reset_bend: layer name required" << endl; return {}; }
+        m_model->reset_bend(std::string(args[0]));
+        return {};
+      }};
+
+  message<> reset_all_bends{
+      this, "reset_all_bends", "Reset all layers to their original weights",
+      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
+        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
+        m_model->reset_all_bends();
+        return {};
+      }};
+
   // BOOT STAMP
   message<> maxclass_setup{
       this, "maxclass_setup",
       [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
         cout << "nn~ " << VERSION << " - torch " << TORCH_VERSION
              << " - 2023 - Antoine Caillon & Axel Chemla--Romeu-Santos, mod by "
-                "Błażej Kotowski, Leonardo Foletto"
+                "Błażej Kotowski, Nico García-Peguinho"
              << endl;
         cout << "visit https://caillonantoine.github.io" << endl;
         return {};
@@ -251,20 +314,21 @@ void model_perform_loop(nn *nn_instance) {
     out_model.push_back(ptr.get());
 
   while (!nn_instance->m_should_stop_perform_thread) {
-    if (nn_instance->m_data_available_lock.try_acquire_for(
-            std::chrono::milliseconds(200))) {
-      nn_instance->m_model->perform(in_model, out_model,
-                                    nn_instance->m_buffer_size,
-                                    nn_instance->m_method, 1);
-      nn_instance->m_result_available_lock.release();
-    }
+    while (!nn_instance->m_data_available.load(std::memory_order_acquire))
+      nn_instance->m_data_available.wait(false);
+    nn_instance->m_data_available.store(false, std::memory_order_relaxed);
+    if (nn_instance->m_should_stop_perform_thread) break;
+    nn_instance->m_model->perform(in_model, out_model,
+                                  nn_instance->m_buffer_size,
+                                  nn_instance->m_method, 1);
+    nn_instance->m_result_available.store(true, std::memory_order_release);
   }
 }
 
 nn::nn(const atoms &args)
     : m_compute_thread(nullptr), m_in_dim(1), m_in_ratio(1), m_out_dim(1),
       m_out_ratio(1), m_buffer_size(4096), m_method("forward"),
-      m_use_thread(true), m_data_available_lock(0), m_result_available_lock(1),
+      m_use_thread(true), m_data_available(false), m_result_available(true),
       m_should_stop_perform_thread(false) {
 
   m_model = std::make_unique<Backend>();
@@ -375,6 +439,8 @@ nn::nn(const atoms &args)
 
 nn::~nn() {
   m_should_stop_perform_thread = true;
+  m_data_available.store(true);
+  m_data_available.notify_one();
   if (m_compute_thread)
     m_compute_thread->join();
 }
@@ -398,6 +464,13 @@ void fill_with_zero(audio_bundle output) {
 
 void nn::operator()(audio_bundle input, audio_bundle output) {
   auto dsp_vec_size = output.frame_count();
+
+#ifdef __SSE__
+  _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+#endif
+#ifdef __SSE3__
+  _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
 
   // CHECK IF MODEL IS LOADED AND ENABLED
   if (!m_model->is_loaded() || !enable) {
@@ -441,17 +514,22 @@ void nn::perform(audio_bundle input, audio_bundle output) {
       for (int c(0); c < m_out_dim; c++)
         m_out_buffer[c].put(m_out_model[c].get(), m_buffer_size);
 
-    } else if (m_result_available_lock.try_acquire()) {
-      // TRANSFER MEMORY BETWEEN INPUT CIRCULAR BUFFER AND MODEL BUFFER
-      for (int c(0); c < m_in_dim; c++)
-        m_in_buffer[c].get(m_in_model[c].get(), m_buffer_size);
+    } else {
+      bool expected = true;
+      if (m_result_available.compare_exchange_strong(expected, false,
+                                                     std::memory_order_acquire)) {
+        // TRANSFER MEMORY BETWEEN INPUT CIRCULAR BUFFER AND MODEL BUFFER
+        for (int c(0); c < m_in_dim; c++)
+          m_in_buffer[c].get(m_in_model[c].get(), m_buffer_size);
 
-      // TRANSFER MEMORY BETWEEN OUTPUT CIRCULAR BUFFER AND MODEL BUFFER
-      for (int c(0); c < m_out_dim; c++)
-        m_out_buffer[c].put(m_out_model[c].get(), m_buffer_size);
+        // TRANSFER MEMORY BETWEEN OUTPUT CIRCULAR BUFFER AND MODEL BUFFER
+        for (int c(0); c < m_out_dim; c++)
+          m_out_buffer[c].put(m_out_model[c].get(), m_buffer_size);
 
-      // SIGNAL PERFORM THREAD THAT DATA IS AVAILABLE
-      m_data_available_lock.release();
+        // SIGNAL PERFORM THREAD THAT DATA IS AVAILABLE
+        m_data_available.store(true, std::memory_order_release);
+        m_data_available.notify_one();
+      }
     }
   }
 

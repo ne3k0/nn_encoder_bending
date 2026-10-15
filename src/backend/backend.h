@@ -1,12 +1,19 @@
 #pragma once
+#include "bend_registry.h"
 #include <mutex>
 #include <string>
 #include <torch/script.h>
 #include <torch/torch.h>
+#include <unordered_map>
 #include <vector>
 
 class Backend {
 protected:
+  using ArgsType = std::vector<c10::IValue>;
+  using KwargsType = std::unordered_map<std::string, c10::IValue>;
+  ArgsType empty_args() { return ArgsType(); }
+  KwargsType empty_kwargs() { return KwargsType(); }
+
   torch::jit::script::Module m_model;
   int m_loaded;
   std::string m_path;
@@ -14,6 +21,7 @@ protected:
   std::vector<std::string> m_available_methods;
   c10::DeviceType m_device;
   bool m_use_gpu;
+  BendRegistry m_registry;
 
 public:
   Backend();
@@ -37,7 +45,14 @@ public:
   torch::jit::script::Module get_model() { return m_model; }
   void use_gpu(bool value);
 
-  std::vector<std::string> get_available_layers();
   std::vector<float> get_layer_weights(std::string layer_name);
-  void set_layer_weights(std::string layer_name, std::vector<float> weights);
+  std::vector<int64_t> get_layer_shape(std::string layer_name);
+  std::string get_layer_group(std::string layer_name);
+  std::string get_layer_role(std::string layer_name);
+
+  std::vector<std::string> get_bend_groups();
+  std::vector<std::string> get_bend_layers_in_group(std::string group);
+  void bend_layer(std::string layer, std::vector<float> weights);
+  void reset_bend(std::string layer);
+  void reset_all_bends();
 };

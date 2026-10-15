@@ -2,6 +2,7 @@
 #include "parsing_utils.h"
 #include <algorithm>
 #include <iostream>
+#include <stdexcept>
 #include <stdlib.h>
 
 #define CPU torch::kCPU
@@ -53,12 +54,19 @@ void Backend::perform(std::vector<float *> in_buffer,
   std::unique_lock<std::mutex> model_lock(m_model_mutex);
   cat_tensor_in = cat_tensor_in.to(m_device);
   std::vector<torch::jit::IValue> inputs = {cat_tensor_in};
+  auto kwargs = empty_kwargs();
 
   // PROCESS TENSOR
   at::Tensor tensor_out;
+  // if .ts returns tuple (network bending version), then use element[0] of tuple (latent vector)
   try {
-    tensor_out = m_model.get_method(method)(inputs).toTensor();
-    tensor_out = tensor_out.repeat_interleave(out_ratio).reshape(
+    auto result = m_model.get_method(method)(inputs, kwargs);
+    if (result.isTuple()) {
+      tensor_out = result.toTuple()->elements()[0].toTensor();
+    } else {
+      tensor_out = result.toTensor();
+    }
+    tensor_out = tensor_out.repeat_interleave(out_ratio, /*dim=*/2).reshape(
         {n_batches, out_dim, -1});
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
@@ -90,7 +98,8 @@ void Backend::perform(std::vector<float *> in_buffer,
 
   tensor_out = tensor_out.to(CPU);
   tensor_out = tensor_out.reshape({out_batches * out_channels, -1});
-  auto out_ptr = tensor_out.contiguous().data_ptr<float>();
+  tensor_out = tensor_out.contiguous();
+  auto out_ptr = tensor_out.data_ptr<float>();
 
   for (int i(0); i < out_buffer.size(); i++) {
     memcpy(out_buffer[i], out_ptr + i * n_vec, n_vec * sizeof(float));
@@ -107,6 +116,12 @@ int Backend::load(std::string path) {
     m_model = model;
     m_loaded = 1;
     model_lock.unlock();
+
+    m_registry.load(m_model);
+
+    std::unique_lock<std::mutex> bend_lock(m_model_mutex);
+    m_registry.apply_to_model(m_model);
+    bend_lock.unlock();
 
     m_available_methods = get_available_methods();
     m_path = path;
@@ -234,7 +249,7 @@ std::vector<c10::IValue> Backend::get_attribute(std::string attribute_name) {
 
 std::string Backend::get_attribute_as_string(std::string attribute_name) {
   std::vector<c10::IValue> getter_outputs = get_attribute(attribute_name);
-  // finstringd arguments
+  // find string arguments
   torch::Tensor setter_params;
   try {
     std::unique_lock<std::mutex> model_lock(m_model_mutex);
@@ -305,6 +320,8 @@ void Backend::set_attribute(std::string attribute_name,
   }
   std::cout << "set_attribute: found setter and params" << std::endl;
   // process inputs
+  if ((int)attribute_args.size() < setter_params.size(0))
+    throw std::runtime_error("not enough arguments for " + attribute_name);
   std::vector<c10::IValue> setter_inputs = {};
   for (int i = 0; i < setter_params.size(0); i++) {
     int current_id = setter_params[i].item().toInt();
@@ -375,55 +392,72 @@ int Backend::get_higher_ratio() {
   return higher_ratio;
 }
 
-std::vector<std::string> Backend::get_available_layers() {
-  std::vector<std::string> layers;
-  std::unique_lock<std::mutex> model_lock(m_model_mutex);
-  for (const auto &layer : m_model.named_parameters())
-    layers.push_back(layer.name);
-  model_lock.unlock();
-  return layers;
-}
-
-
 std::vector<float> Backend::get_layer_weights(std::string layer_name) {
   std::unique_lock<std::mutex> model_lock(m_model_mutex);
   // auto m_tensor = m_model.attr(layer_name).toTensor();
   // torch::Tensor m_tensor = m_model.named_parameters()["layer"].contiguous().to(CPU);
   torch::Tensor m_tensor;
   for (const auto &layer : m_model.named_parameters())
-    if (layer.name == layer_name)
+    if (layer.name == layer_name) {
       m_tensor = layer.value.contiguous().to(CPU);
+      break;
+    }
   model_lock.unlock();
 
-  auto m_weights = std::vector(m_tensor.data_ptr<float>(), m_tensor.data_ptr<float>()+m_tensor.numel());
+  if (!m_tensor.defined())
+    return {};
+
+  // removed 1024 cap — get_weights_buf writes to buffer~ directly and has no size limit
+  // any cap for the message-path (get_weights) belongs in the nn_tilde message handler, not here
+  auto m_weights = std::vector(m_tensor.data_ptr<float>(), m_tensor.data_ptr<float>() + m_tensor.numel());
   return m_weights;
 }
 
-void Backend::set_layer_weights(std::string layer_name,
-                                std::vector<float> weights) {
-  std::cout << "set_layer_weights: entering the function" << std::endl;
+
+std::vector<std::string> Backend::get_bend_groups() {
+  return m_registry.get_groups();
+}
+
+
+std::vector<std::string> Backend::get_bend_layers_in_group(std::string group) {
+  return m_registry.get_layers_in_group(group);
+}
+
+
+void Backend::bend_layer(std::string layer, std::vector<float> weights) {
+  auto tensor = torch::from_blob(weights.data(), {(long)weights.size()});
+  m_registry.set_bend(layer, tensor);
   std::unique_lock<std::mutex> model_lock(m_model_mutex);
+  m_registry.apply_to_model(m_model);
+}
 
-  for (const auto &layer : m_model.named_parameters())
-    if (layer.name == layer_name) {
-      std::cout << "first layer weight before copy " << layer.value[0] << std::endl;
-      {
-        torch::NoGradGuard no_grad;
-        // std::vector<int> sizes = layer.value.sizes().vec();
-        // TODO: Ensure the correct shape casting
-        layer.value.copy_(torch::from_blob(weights.data(), layer.value.sizes()));
-      }
-    }
 
-  std::cout << "set_layer_weights: weights copied" << std::endl;
+void Backend::reset_bend(std::string layer) {
+  std::unique_lock<std::mutex> model_lock(m_model_mutex);
+  m_registry.reset_bend(layer, m_model);
+}
 
-  for (const auto &layer : m_model.named_parameters())
-    if (layer.name == layer_name)
-      std::cout << "first layer weight after copy " << layer.value[0] << std::endl;
-  model_lock.unlock();
+
+void Backend::reset_all_bends() {
+  std::unique_lock<std::mutex> model_lock(m_model_mutex);
+  m_registry.reset_all(m_model);
+}
+
+
+std::vector<int64_t> Backend::get_layer_shape(std::string layer_name) {
+  return m_registry.get_layer_shape(layer_name);
+}
+
+std::string Backend::get_layer_group(std::string layer_name) {
+  return m_registry.get_group(layer_name);
+}
+
+std::string Backend::get_layer_role(std::string layer_name) {
+  return m_registry.get_role(layer_name);
 }
 
 bool Backend::is_loaded() { return m_loaded; }
+
 
 void Backend::use_gpu(bool value) {
   std::unique_lock<std::mutex> model_lock(m_model_mutex);

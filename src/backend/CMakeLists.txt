@@ -4,9 +4,9 @@ project(backend)
 find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
-add_library(backend STATIC parsing_utils.cpp backend.cpp)
+add_library(backend STATIC parsing_utils.cpp backend.cpp bend_registry.cpp)
 target_link_libraries(backend "${TORCH_LIBRARIES}")
-set_property(TARGET backend PROPERTY CXX_STANDARD 17)
+set_property(TARGET backend PROPERTY CXX_STANDARD 20)
 
 if(MSVC)
   set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MT")
