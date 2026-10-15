@@ -1,3 +1,23 @@
+# nn_encoder_bending
+
+A Max/MSP toolkit for **live neural network bending** of RAVE models, focused on manipulating encoder layer weights in real time.
+
+//TODO
+- enable activation bending via adding I/O's to computation graph
+- bending operations for various different shaped tensors
+
+Exposes the encoder's convolutional filters, batch normalisation parameters, and latent projection weights via a bending API (`get_layer`, `bend_layer`, `reset_bend`, `reload_model`) that persists transformations across model reloads.
+
+Built for `nn~`, `mc.nn~`, and `mcs.nn~` externals (Max/MSP only).
+
+## Credits
+
+- [nn_tilde](https://github.com/acids-ircam/nn_tilde) — Antoine Caillon & Axel Chemla--Romeu-Santos (ACIDS IRCAM)
+- [nn_tilde_bending](https://github.com/blazejkotowski/nn_tilde_bending) — Błażej Kotowski (UPF MTG)
+- nn_encoder_bending — Nico García-Peguinho
+
+---
+
 ![banner](https://github.com/acids-ircam/nn_tilde/raw/master/assets/banner.png)
 
 # Demonstration video
