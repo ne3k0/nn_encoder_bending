@@ -1,6 +1,6 @@
 #include "bend_registry.h"
 #include <cstdio>
-#include <sstream>
+#include <iostream>
 #include <unordered_map>
 
 // reads model to determine which naming paradigm the imported model follows
@@ -66,7 +66,11 @@ void BendRegistry::load(const torch::jit::script::Module &model) {
     m_group_order.clear();
     m_original_state.clear();
     populate(model);
-    m_loaded = true;
+    // only mark loaded when populate registered at least one layer — UNKNOWN variant leaves the registry empty
+    m_loaded = (m_variant != RaveVariant::UNKNOWN);
+    if (!m_loaded) {
+        fprintf(stderr, "BendRegistry::load: unrecognised model variant — no layers registered\n");
+    }
 }
 
 
@@ -93,18 +97,23 @@ void BendRegistry::populate(const torch::jit::script::Module &model) {
 
     struct ConvInfo { std::string name; int64_t out_ch; };
 
-    auto split_latent = [&](std::vector<ConvInfo> &convs,
-                            std::string &latent_name,
-                            std::string &latent_bias_name) {
+    // "encoder.0.weight" → "encoder.0.bias"
+    auto bias_name_for = [](const std::string &weight_name) {
+        return weight_name.substr(0, weight_name.size() - 6) + "bias";
+    };
+
+    auto split_latent = [&](std::vector<ConvInfo> &convs, std::string &latent_name, std::string &latent_bias_name) {
         if (convs.empty()) { return; }
         // the RAVE latent projection always reduces channel count vs the preceding conv
         if (convs.size() >= 2 && convs.back().out_ch > convs[convs.size() - 2].out_ch) {
-            fprintf(stderr, "BendRegistry: latent heuristic warning for '%s' — output channels do not decrease; check model structure\n",
-                convs.back().name.c_str());
+            fprintf(stderr, "BendRegistry: latent projection layer heuristic may be wrong — '%s' (%lld ch) has more output channels than the preceding conv (%lld ch)\n",
+                convs.back().name.c_str(),
+                (long long)convs.back().out_ch,
+                (long long)convs[convs.size() - 2].out_ch);
         }
         latent_name = convs.back().name;
         convs.pop_back();
-        std::string lb = latent_name.substr(0, latent_name.size() - 6) + "bias";
+        std::string lb = bias_name_for(latent_name);
         if (param_map.count(lb)) {
             latent_bias_name = lb;
         }
@@ -152,7 +161,7 @@ void BendRegistry::populate(const torch::jit::script::Module &model) {
                     if (convs[i].out_ch == latent_out_ch) {
                         latent_name = convs[i].name;
                         convs.erase(convs.begin() + i);
-                        std::string lb = latent_name.substr(0, latent_name.size() - 6) + "bias";
+                        std::string lb = bias_name_for(latent_name);
                         if (param_map.count(lb)) { latent_bias_name = lb; }
                         break;
                     }
@@ -168,7 +177,7 @@ void BendRegistry::populate(const torch::jit::script::Module &model) {
         int stage = 1;
         for (const auto &name : bn_names) {
             add_layer(name, "encoder_bn", "encoder stage " + std::to_string(stage) + " — channel gain", param_map.at(name));
-            std::string bias = name.substr(0, name.size() - 6) + "bias";
+            std::string bias = bias_name_for(name);
             // quantised models may zero bn weights without removing them — bending will restore them
             if (param_map.count(bias)) {
                 add_layer(bias, "encoder_bn", "encoder stage " + std::to_string(stage) + " — channel offset", param_map.at(bias));
@@ -183,9 +192,9 @@ void BendRegistry::populate(const torch::jit::script::Module &model) {
         }
 
         if (!latent_name.empty()) {
-            add_layer(latent_name, "encoder_latent", "latent projection", param_map.at(latent_name));
+            add_layer(latent_name, "encoder_projection", "latent projection", param_map.at(latent_name));
             if (!latent_bias_name.empty()) {
-                add_layer(latent_bias_name, "encoder_latent", "latent projection offset", param_map.at(latent_bias_name));
+                add_layer(latent_bias_name, "encoder_projection", "latent projection offset", param_map.at(latent_bias_name));
             }
         }
 
@@ -215,9 +224,9 @@ void BendRegistry::populate(const torch::jit::script::Module &model) {
         }
 
         if (!latent_name.empty()) {
-            add_layer(latent_name, "encoder_latent", "latent projection", param_map.at(latent_name));
+            add_layer(latent_name, "encoder_projection", "latent projection", param_map.at(latent_name));
             if (!latent_bias_name.empty()) {
-                add_layer(latent_bias_name, "encoder_latent", "latent projection offset", param_map.at(latent_bias_name));
+                add_layer(latent_bias_name, "encoder_projection", "latent projection offset", param_map.at(latent_bias_name));
             }
         }
 
@@ -259,18 +268,21 @@ std::vector<std::string> BendRegistry::get_all_layers_list() const {
     return names;
 }
 
-std::string BendRegistry::get_role(const std::string &layer) const {
+const BendLayer *BendRegistry::find_layer(const std::string &name) const {
     for (const auto &l : m_layers) {
-        if (l.name == layer) { return l.role; }
+        if (l.name == name) { return &l; }
     }
-    return "";
+    return nullptr;
+}
+
+std::string BendRegistry::get_role(const std::string &layer) const {
+    const BendLayer *l = find_layer(layer);
+    return l ? l->role : "";
 }
 
 std::string BendRegistry::get_group(const std::string &layer) const {
-    for (const auto &l : m_layers) {
-        if (l.name == layer) { return l.group; }
-    }
-    return "";
+    const BendLayer *l = find_layer(layer);
+    return l ? l->group : "";
 }
 
 std::vector<int64_t> BendRegistry::get_layer_shape(const std::string &layer) const {
@@ -281,17 +293,10 @@ std::vector<int64_t> BendRegistry::get_layer_shape(const std::string &layer) con
     return shape;
 }
 
-void BendRegistry::set_bend(const std::string &layer, torch::Tensor value) {
-    bool found = false;
-    for (const auto &l : m_layers) {
-        if (l.name == layer) {
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
+bool BendRegistry::set_bend(const std::string &layer, torch::Tensor value) {
+    if (!find_layer(layer)) {
         fprintf(stderr, "BendRegistry::set_bend: unknown layer '%s'\n", layer.c_str());
-        return;
+        return false;
     }
     auto orig_it = m_original_state.find(layer);
     if (orig_it != m_original_state.end() && value.numel() == orig_it->second.numel()) {
@@ -299,6 +304,8 @@ void BendRegistry::set_bend(const std::string &layer, torch::Tensor value) {
     } else {
         m_bend_state[layer] = value.clone();
     }
+    m_dirty = true;
+    return true;
 }
 
 void BendRegistry::reset_bend(const std::string &layer, torch::jit::script::Module &model) {
@@ -312,6 +319,7 @@ void BendRegistry::reset_bend(const std::string &layer, torch::jit::script::Modu
             break;
         }
     }
+    m_dirty = true;
 }
 
 void BendRegistry::reset_all(torch::jit::script::Module &model) {
@@ -322,6 +330,7 @@ void BendRegistry::reset_all(torch::jit::script::Module &model) {
             param.value.data().copy_(it->second);
         }
     }
+    m_dirty = true;
 }
 
 bool BendRegistry::has_bend(const std::string &layer) const {
@@ -336,18 +345,18 @@ torch::Tensor BendRegistry::get_bend(const std::string &layer) const {
     return it->second.clone();
 }
 
-void BendRegistry::apply_to_model(torch::jit::script::Module &model) const {
+bool BendRegistry::apply_to_model(torch::jit::script::Module &model) {
+    bool all_ok = true;
     for (const auto &kv : m_bend_state) {
         bool found = false;
         for (auto param : model.named_parameters()) {
             if (param.name == kv.first) {
                 found = true;
                 if (param.value.sizes() != kv.second.sizes()) {
-                    std::ostringstream oss;
-                    oss << "BendRegistry::apply_to_model: shape mismatch for '" << kv.first
-                        << "' — expected " << param.value.sizes()
-                        << ", got " << kv.second.sizes() << "\n";
-                    fprintf(stderr, "%s", oss.str().c_str());
+                    std::cerr << "BendRegistry::apply_to_model: shape mismatch for '" << kv.first
+                              << "' — expected " << param.value.sizes()
+                              << ", got " << kv.second.sizes() << "\n";
+                    all_ok = false;
                     break;
                 }
                 param.value.data().copy_(kv.second);
@@ -356,6 +365,9 @@ void BendRegistry::apply_to_model(torch::jit::script::Module &model) const {
         }
         if (!found) {
             fprintf(stderr, "BendRegistry::apply_to_model: layer '%s' not found in model\n", kv.first.c_str());
+            all_ok = false;
         }
     }
+    if (all_ok) m_dirty = false;
+    return all_ok;
 }

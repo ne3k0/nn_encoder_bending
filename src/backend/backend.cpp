@@ -18,20 +18,17 @@ void Backend::perform(std::vector<float *> in_buffer,
                       std::string method, int n_batches) {
   c10::InferenceMode guard;
 
-  auto params = get_method_params(method);
-  // std::cout << "in_buffer length : " << in_buffer.size() << std::endl;
-  // std::cout << "out_buffer length : " << out_buffer.size() << std::endl;
+  if (!m_loaded) return;
 
-  if (!params.size())
-    return;
+  auto cache_it = m_params_cache.find(method);
+  if (cache_it == m_params_cache.end()) return;
+  const auto &params = cache_it->second;
+  if (params.size() < 4) return;
 
   auto in_dim = params[0];
   auto in_ratio = params[1];
   auto out_dim = params[2];
   auto out_ratio = params[3];
-
-  if (!m_loaded)
-    return;
 
   // COPY BUFFER INTO A TENSOR
   std::vector<at::Tensor> tensor_in;
@@ -52,6 +49,8 @@ void Backend::perform(std::vector<float *> in_buffer,
 
   // SEND TENSOR TO DEVICE
   std::unique_lock<std::mutex> model_lock(m_model_mutex);
+  if (m_registry.is_dirty())
+    m_registry.apply_to_model(m_model);
   cat_tensor_in = cat_tensor_in.to(m_device);
   std::vector<torch::jit::IValue> inputs = {cat_tensor_in};
   auto kwargs = empty_kwargs();
@@ -115,15 +114,15 @@ int Backend::load(std::string path) {
     std::unique_lock<std::mutex> model_lock(m_model_mutex);
     m_model = model;
     m_loaded = 1;
+    m_registry_loaded = false; // will be initialised lazily on first bending call
     model_lock.unlock();
 
-    m_registry.load(m_model);
-
-    std::unique_lock<std::mutex> bend_lock(m_model_mutex);
-    m_registry.apply_to_model(m_model);
-    bend_lock.unlock();
-
     m_available_methods = get_available_methods();
+    m_params_cache.clear();
+    for (const auto &m : m_available_methods) {
+      auto p = get_method_params(m);
+      if (p.size() == 4) m_params_cache[m] = p;
+    }
     m_path = path;
     return 0;
   } catch (const std::exception &e) {
@@ -392,6 +391,21 @@ int Backend::get_higher_ratio() {
   return higher_ratio;
 }
 
+void Backend::ensure_registry_loaded() {
+  if (m_registry_loaded) return;
+  std::unique_lock<std::mutex> model_lock(m_model_mutex);
+  if (m_registry_loaded) return; // double-check after acquiring lock
+  try {
+    m_registry.load(m_model);
+    if (m_registry.is_dirty())
+      m_registry.apply_to_model(m_model);
+  } catch (const std::exception &e) {
+    std::cerr << "BendRegistry::load failed: " << e.what() << " — bending unavailable\n";
+  }
+  m_registry_loaded = true; // mark done even on failure so we don't retry every call
+}
+
+
 std::vector<float> Backend::get_layer_weights(std::string layer_name) {
   std::unique_lock<std::mutex> model_lock(m_model_mutex);
   // auto m_tensor = m_model.attr(layer_name).toTensor();
@@ -415,30 +429,36 @@ std::vector<float> Backend::get_layer_weights(std::string layer_name) {
 
 
 std::vector<std::string> Backend::get_bend_groups() {
+  ensure_registry_loaded();
   return m_registry.get_groups();
 }
 
 
 std::vector<std::string> Backend::get_bend_layers_in_group(std::string group) {
+  ensure_registry_loaded();
   return m_registry.get_layers_in_group(group);
 }
 
 
 void Backend::bend_layer(std::string layer, std::vector<float> weights) {
+  ensure_registry_loaded();
   auto tensor = torch::from_blob(weights.data(), {(long)weights.size()});
-  m_registry.set_bend(layer, tensor);
   std::unique_lock<std::mutex> model_lock(m_model_mutex);
-  m_registry.apply_to_model(m_model);
+  if (!m_registry.set_bend(layer, tensor))
+    throw std::runtime_error("bend_layer: unknown layer '" + layer + "'");
+  // apply_to_model is deferred to the next perform() call under this same lock
 }
 
 
 void Backend::reset_bend(std::string layer) {
+  ensure_registry_loaded();
   std::unique_lock<std::mutex> model_lock(m_model_mutex);
   m_registry.reset_bend(layer, m_model);
 }
 
 
 void Backend::reset_all_bends() {
+  ensure_registry_loaded();
   std::unique_lock<std::mutex> model_lock(m_model_mutex);
   m_registry.reset_all(m_model);
 }

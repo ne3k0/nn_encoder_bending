@@ -65,6 +65,13 @@ public:
   std::unique_ptr<std::thread> m_compute_thread;
   std::atomic<bool> m_data_available;
   std::atomic<bool> m_result_available;
+  std::atomic<bool> m_overrun{false};
+
+  timer<> m_overrun_timer{this, [this](const atoms&, const int) -> atoms {
+    if (m_overrun.exchange(false))
+      cerr << "nn~: vector size larger than buffer size — model disabled" << endl;
+    return {};
+  }};
 
   void operator()(audio_bundle input, audio_bundle output);
   void perform(audio_bundle input, audio_bundle output);
@@ -87,142 +94,17 @@ public:
                       description{"Enable / disable gpu usage when available"},
                       setter{[this](const c74::min::atoms &args,
                                     const int inlet) -> c74::min::atoms {
-                        if (m_model->is_loaded())
+                        if (m_model && m_model->is_loaded())
                           m_model->use_gpu(bool(args[0]));
                         return args;
                       }}};
 
-  // NN BENDING MOD
+  // NN BENDING MOD — outlet 0, before signal outlets, matching saved patches
   outlet<> m_info_outlet{this, "info", "Info outlet for bend groups, layer metadata, and confirmations"};
 
   // buffer_reference used by get_layer and bend_layer for buffer~ transport
   // create_messages=false prevents auto-registering "set"/"dblclick"/"notify" which would conflict
   buffer_reference m_tensor_buf_ref { this, nullptr, false };
-
-  // get_layer <layer_name> <buffer_name>
-  // writes flat floats into buffer~ (auto-resized), then sends layer_info out info outlet:
-  //   layer_info <name> <total_floats> <ndim> <d0> [d1] [d2] <group>
-  message<> get_layer{
-      this, "get_layer", "Fetch a layer's weights into a named buffer~",
-      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
-        if (args.size() < 2) { cerr << "get_layer: layer name and buffer name required" << endl; return {}; }
-        std::string layer_name = args[0];
-        symbol buf_name = symbol(std::string(args[1]));
-        std::vector<float> weights = m_model->get_layer_weights(layer_name);
-        if (weights.empty()) {
-          cerr << "get_layer: no weights found for '" << layer_name << "'" << endl;
-          return {};
-        }
-        m_tensor_buf_ref.set(buf_name);
-        if (!m_tensor_buf_ref) {
-          cerr << "get_layer: buffer~ '" << std::string(buf_name) << "' not found" << endl;
-          return {};
-        }
-        // resize in separate scope first — resize invalidates the internal pointer
-        { buffer_lock<false> size_lock(m_tensor_buf_ref); size_lock.resize_in_samples(static_cast<int>(weights.size())); }
-        {
-          buffer_lock<false> lock(m_tensor_buf_ref);
-          if (!lock.valid()) { cerr << "get_layer: buffer~ resize failed" << endl; return {}; }
-          if (lock.frame_count() < weights.size()) { cerr << "get_layer: buffer~ too small after resize (" << lock.frame_count() << " < " << weights.size() << ")" << endl; return {}; }
-          for (size_t i = 0; i < weights.size(); i++) { lock[i] = weights[i]; }
-          lock.dirty();
-        }
-        auto shape = m_model->get_layer_shape(layer_name);
-        std::string group = m_model->get_layer_group(layer_name);
-        atoms out;
-        out.push_back("layer_info");
-        out.push_back(symbol(layer_name));
-        out.push_back(static_cast<int>(weights.size()));
-        out.push_back(static_cast<int>(shape.size()));
-        for (auto d : shape) { out.push_back(static_cast<int>(d)); }
-        out.push_back(symbol(group));
-        m_info_outlet.send(out);
-        return {};
-      }};
-
-  // bend_layer <layer_name> <buffer_name>
-  // reads floats from buffer~, reshapes to layer dims, stores in registry (persistent across reloads)
-  // responds: bend_ok <layer_name>
-  message<> bend_layer{
-      this, "bend_layer", "Apply weights from a buffer~ to a layer and persist through reloads",
-      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
-        if (args.size() < 2) { cerr << "bend_layer: layer name and buffer name required" << endl; return {}; }
-        std::string layer_name = args[0];
-        symbol buf_name = symbol(std::string(args[1]));
-        std::vector<float> weights;
-        m_tensor_buf_ref.set(buf_name);
-        if (!m_tensor_buf_ref) {
-          cerr << "bend_layer: buffer~ '" << std::string(buf_name) << "' not found" << endl;
-          return {};
-        }
-        {
-          buffer_lock<false> lock(m_tensor_buf_ref);
-          if (!lock.valid()) { cerr << "bend_layer: buffer~ has no samples" << endl; return {}; }
-          size_t len = lock.frame_count();
-          weights.reserve(len);
-          for (size_t i = 0; i < len; i++) { weights.push_back(lock[i]); }
-        }
-        try {
-          m_model->bend_layer(layer_name, weights);
-          m_info_outlet.send("bend_ok", symbol(layer_name));
-        } catch (const std::exception &e) {
-          cerr << "bend_layer: " << e.what() << endl;
-        }
-        return {};
-      }};
-
-  message<> reload_model{
-      this, "reload_model", "Reload the model from disk and re-apply stored bends",
-      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_model->is_loaded()) { cerr << "reload_model: no model loaded" << endl; return {}; }
-        m_model->reload();
-        return {};
-      }};
-
-  message<> get_bend_groups{
-      this, "get_bend_groups", "Get available bend groups",
-      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
-        atoms out;
-        out.push_back("bend_groups");
-        for (const auto &g : m_model->get_bend_groups())
-          out.push_back(g);
-        m_info_outlet.send(out);
-        return {};
-      }};
-
-  message<> get_bend_layers{
-      this, "get_bend_layers", "Get layers in a bend group",
-      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
-        if (args.size() < 1) { cerr << "get_bend_layers: group name required" << endl; return {}; }
-        std::string group = args[0];
-        atoms out;
-        out.push_back("bend_layers");
-        for (const auto &l : m_model->get_bend_layers_in_group(group))
-          out.push_back(l);
-        m_info_outlet.send(out);
-        return {};
-      }};
-
-  message<> reset_bend{
-      this, "reset_bend", "Reset a layer to its original weights",
-      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
-        if (args.size() < 1) { cerr << "reset_bend: layer name required" << endl; return {}; }
-        m_model->reset_bend(std::string(args[0]));
-        return {};
-      }};
-
-  message<> reset_all_bends{
-      this, "reset_all_bends", "Reset all layers to their original weights",
-      [this](const c74::min::atoms &args, const int inlet) -> c74::min::atoms {
-        if (!m_model->is_loaded()) { cerr << "Model not initialized" << endl; return {}; }
-        m_model->reset_all_bends();
-        return {};
-      }};
 
   // BOOT STAMP
   message<> maxclass_setup{
@@ -250,6 +132,98 @@ public:
         } else if (attribute_name == "get_methods") {
           for (std::string method : m_model->get_available_methods())
             cout << method << endl;
+          return {};
+        } else if (attribute_name == "get_bend_groups") {
+          if (!m_model->is_loaded()) { cerr << "get_bend_groups: no model loaded" << endl; return {}; }
+          auto groups = m_model->get_bend_groups();
+          if (groups.empty()) return {};
+          atoms out;
+          out.push_back("bend_groups");
+          for (const auto &g : groups)
+            out.push_back(symbol(g));
+          m_info_outlet.send(out);
+          return {};
+        } else if (attribute_name == "get_bend_layers") {
+          if (!m_model->is_loaded()) { cerr << "get_bend_layers: no model loaded" << endl; return {}; }
+          if (args.size() < 2) { cerr << "get_bend_layers: group name required" << endl; return {}; }
+          auto layers = m_model->get_bend_layers_in_group(std::string(args[1]));
+          if (layers.empty()) return {};
+          atoms out;
+          out.push_back("bend_layers");
+          for (const auto &l : layers)
+            out.push_back(symbol(l));
+          m_info_outlet.send(out);
+          return {};
+        } else if (attribute_name == "get_layer") {
+          if (!m_model->is_loaded()) { cerr << "get_layer: no model loaded" << endl; return {}; }
+          if (args.size() < 3) { cerr << "get_layer: layer name and buffer name required" << endl; return {}; }
+          std::string layer_name = std::string(args[1]);
+          symbol buf_name = symbol(std::string(args[2]));
+          std::vector<float> weights = m_model->get_layer_weights(layer_name);
+          if (weights.empty()) { cerr << "get_layer: no weights for '" << layer_name << "'" << endl; return {}; }
+          m_tensor_buf_ref.set(buf_name);
+          if (!m_tensor_buf_ref) { cerr << "get_layer: buffer~ '" << std::string(buf_name) << "' not found" << endl; return {}; }
+          {
+            c74::max::t_symbol* bsym = c74::max::gensym(std::string(buf_name).c_str());
+            if (bsym && bsym->s_thing) {
+              c74::max::t_atom resize_args[2];
+              c74::max::atom_setlong(&resize_args[0], static_cast<c74::max::t_atom_long>(weights.size()));
+              c74::max::atom_setlong(&resize_args[1], 1L);
+              c74::max::object_method_typed(
+                static_cast<c74::max::t_object*>(bsym->s_thing),
+                c74::max::gensym("sizeinsamps"), 2, resize_args, nullptr);
+            }
+          }
+          {
+            buffer_lock<false> lock(m_tensor_buf_ref);
+            if (!lock.valid()) { cerr << "get_layer: buffer~ resize failed" << endl; return {}; }
+            for (size_t i = 0; i < weights.size(); i++) lock[i] = weights[i];
+            lock.dirty();
+          }
+          auto shape = m_model->get_layer_shape(layer_name);
+          atoms out;
+          out.push_back("layer_info");
+          out.push_back(symbol(layer_name));
+          out.push_back(static_cast<int>(weights.size()));
+          out.push_back(static_cast<int>(shape.size()));
+          for (auto d : shape) out.push_back(static_cast<int>(d));
+          out.push_back(symbol(m_model->get_layer_group(layer_name)));
+          m_info_outlet.send(out);
+          return {};
+        } else if (attribute_name == "bend_layer") {
+          if (!m_model->is_loaded()) { cerr << "bend_layer: no model loaded" << endl; return {}; }
+          if (args.size() < 3) { cerr << "bend_layer: layer name and buffer name required" << endl; return {}; }
+          std::string layer_name = std::string(args[1]);
+          symbol buf_name = symbol(std::string(args[2]));
+          m_tensor_buf_ref.set(buf_name);
+          if (!m_tensor_buf_ref) { cerr << "bend_layer: buffer~ '" << std::string(buf_name) << "' not found" << endl; return {}; }
+          std::vector<float> weights;
+          {
+            buffer_lock<false> lock(m_tensor_buf_ref);
+            if (!lock.valid()) { cerr << "bend_layer: buffer~ has no samples" << endl; return {}; }
+            size_t len = lock.frame_count();
+            weights.reserve(len);
+            for (size_t i = 0; i < len; i++) weights.push_back(lock[i]);
+          }
+          try {
+            m_model->bend_layer(layer_name, weights);
+            m_info_outlet.send("bend_ok", symbol(layer_name));
+          } catch (const std::exception &e) {
+            cerr << "bend_layer: " << e.what() << endl;
+          }
+          return {};
+        } else if (attribute_name == "reset_bend") {
+          if (!m_model->is_loaded()) { cerr << "reset_bend: no model loaded" << endl; return {}; }
+          if (args.size() < 2) { cerr << "reset_bend: layer name required" << endl; return {}; }
+          m_model->reset_bend(std::string(args[1]));
+          return {};
+        } else if (attribute_name == "reset_all_bends") {
+          if (!m_model->is_loaded()) { cerr << "reset_all_bends: no model loaded" << endl; return {}; }
+          m_model->reset_all_bends();
+          return {};
+        } else if (attribute_name == "reload_model") {
+          if (!m_model->is_loaded()) { cerr << "reload_model: no model loaded" << endl; return {}; }
+          m_model->reload();
           return {};
         } else if (attribute_name == "get") {
           if (args.size() < 2) {
@@ -480,11 +454,9 @@ void nn::operator()(audio_bundle input, audio_bundle output) {
 
   // CHECK IF DSP_VEC_SIZE IS LARGER THAN BUFFER SIZE
   if (dsp_vec_size > m_buffer_size) {
-    cerr << "vector size (" << dsp_vec_size << ") ";
-    cerr << "larger than buffer size (" << m_buffer_size << "). ";
-    cerr << "disabling model.";
-    cerr << endl;
     enable = false;
+    m_overrun.store(true, std::memory_order_relaxed);
+    m_overrun_timer.delay(0);
     fill_with_zero(output);
     return;
   }

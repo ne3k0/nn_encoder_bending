@@ -16,6 +16,7 @@ protected:
 
   torch::jit::script::Module m_model;
   int m_loaded;
+  bool m_registry_loaded = false;
   std::string m_path;
   std::mutex m_model_mutex;
   std::vector<std::string> m_available_methods;
@@ -40,6 +41,7 @@ public:
   std::vector<int> get_method_params(std::string method);
   int get_higher_ratio();
   int load(std::string path);
+  std::unordered_map<std::string, std::vector<int>> m_params_cache;
   int reload();
   bool is_loaded();
   torch::jit::script::Module get_model() { return m_model; }
@@ -50,6 +52,7 @@ public:
   std::string get_layer_group(std::string layer_name);
   std::string get_layer_role(std::string layer_name);
 
+  void ensure_registry_loaded();
   std::vector<std::string> get_bend_groups();
   std::vector<std::string> get_bend_layers_in_group(std::string group);
   void bend_layer(std::string layer, std::vector<float> weights);
